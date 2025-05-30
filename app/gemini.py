@@ -15,7 +15,8 @@ from json.decoder import JSONDecodeError
 from .model_selector import call_model
 from .ai_gemini import call_gemini_api
 from .ai_gpt import call_openai_api
-import json5
+from rest_framework.decorators import authentication_classes, permission_classes
+from rest_framework.permissions import AllowAny
 
 
 # Setup logging for debugging
@@ -242,38 +243,16 @@ Return JSON:
 }}
 """
 }
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_API_KEY = "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"
-
-def call_groq_api(prompt):
-    # Make the request to the GROQ API
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    # Define the model you want to use (e.g., GPT-3.5 or GPT-4)
-    model = "llama3-70b-8192" # You can change this to "gpt-4" or any other available model
-
-    # Build the request payload with the model
-    data = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-
-    response = requests.post(GROQ_API_URL, headers=headers, json=data)
-
-    if response.status_code != 200:
-        raise Exception(f"Error in API call: {response.status_code}, {response.text}")
-
-    # Log the raw response for inspection
-    logging.info(f"API Response: {response.text[:500]}...")  # Log first 500 characters for brevity
-    return response.text
 
 def build_prompt_from_data(data):
+    """
+    More robust prompt builder with framework aliases
+    """
+    # Normalize inputs
     language = data['language'].lower().strip()
     framework = data['framework'].lower().strip()
 
+    # Handle framework name variations
     framework_aliases = {
         'django rest': ['django rest', 'django-rest', 'django rest framework'],
         'flask': ['flask'],
@@ -282,6 +261,7 @@ def build_prompt_from_data(data):
         'next.js': ['next.js', 'next']
     }
 
+    # Find matching framework
     matched_framework = None
     for key, aliases in framework_aliases.items():
         if framework in aliases:
@@ -302,110 +282,110 @@ def build_prompt_from_data(data):
 
 
 def extract_json(text):
-    # Try multiple methods to extract JSON
-    patterns = [
-        r'```json\n(.*?)\n```',  # Markdown with json specified
-        r'```(.*?)```',  # Generic markdown code block
-        r'({.*})',  # Raw JSON
-    ]
+    import re, json
 
-    for pattern in patterns:
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            candidate = match.group(1).strip()
-            try:
-                # Remove trailing commas
-                candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
+    # Remove markdown code blocks
+    text = re.sub(r'```json|```', '', text, flags=re.IGNORECASE).strip()
 
-    # If no pattern matched, try extracting the outermost braces
+    # Attempt to extract the first {...} block
     start = text.find('{')
     end = text.rfind('}') + 1
-    if start >= 0 and end > 0:
-        candidate = text[start:end]
-        try:
-            candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
+    candidate = text[start:end]
 
-    raise ValueError("Could not extract valid JSON from response")
+    # Fix trailing commas inside JSON
+    candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
+
+    # Now try to parse
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        # log or save candidate for debugging
+        with open("output/json_parse_error.txt", "w") as f:
+            f.write(candidate)
+        raise e
 
 
 def build_app_zip(data):
+    """
+    Main application builder with Gemini API, handling both Django REST and Flask frameworks.
+    """
     try:
         required_keys = ['type', 'login', 'upload', 'layout', 'app_name',
                          'framework', 'language', 'pages', 'color_scheme']
         if not all(k in data for k in required_keys):
             raise ValueError("Missing required fields in input data")
 
+        framework = data['framework'].lower()
+
+        # Generate prompt from user data
         prompt = build_prompt_from_data(data)
         logging.info(f"Generated prompt (truncated): {prompt[:200]}...")
 
-        # Call the API to get the response text
-        response_text = call_groq_api(prompt)
-        logging.info(f"Raw API response (first 500 chars): {response_text[:500]}")
+        # Call Gemini API
+        response_text = call_gemini_api(prompt)
 
-        # Save the raw response
+        # Save raw response for debugging
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        raw_output_path = os.path.join(OUTPUT_DIR, "raw_groq_output.txt")
-        with open(raw_output_path, "w", encoding="utf-8") as f:
+        with open(os.path.join(OUTPUT_DIR, "raw_gemini_output.txt"), "w", encoding="utf-8") as f:
             f.write(response_text)
-        logging.info(f"Saved raw response to {raw_output_path}")
 
-        # Try extracting JSON
+        # Parse JSON output from Gemini response
         try:
             files = extract_json(response_text)
-            logging.info(f"Successfully extracted JSON structure with keys: {files.keys()}")
         except Exception as e:
-            error_path = os.path.join(OUTPUT_DIR, "bad_json_response.txt")
-            with open(error_path, "w", encoding="utf-8") as f:
+            with open(os.path.join(OUTPUT_DIR, "bad_json_response.txt"), "w", encoding="utf-8") as f:
                 f.write(response_text)
-            logging.error(f"JSON parsing failed - saved bad response to {error_path}")
-            raise ValueError(f"Failed to parse API response as JSON: {str(e)}")
+            logging.error("JSON parsing failed - saved bad response")
+            raise
 
-        # Validate the extracted structure
-        if not isinstance(files, dict) or not any(
-                section in files for section in ["frontend", "backend", "documentation", "api"]):
-            logging.error(f"Invalid file structure received: {files}")
-            raise ValueError("API response did not contain expected file sections")
-
-        # Create project directory
         project_id = str(uuid.uuid4())
         project_path = os.path.join(PROJECTS_DIR, project_id)
         os.makedirs(project_path, exist_ok=True)
 
-        # Write files
         written_files = 0
+
+        def write_content(base_path, content):
+            nonlocal written_files
+
+            if isinstance(content, dict):
+                if 'content' in content and isinstance(content['content'], str):
+                    # This is actually a file with metadata
+                    file_content = content['content']
+                    os.makedirs(os.path.dirname(base_path), exist_ok=True)
+                    with open(base_path, "w", encoding="utf-8") as f:
+                        f.write(file_content)
+                    written_files += 1
+                else:
+                    # This is a directory
+                    os.makedirs(base_path, exist_ok=True)
+                    for name, sub_content in content.items():
+                        sub_path = os.path.join(base_path, name)
+                        write_content(sub_path, sub_content)
+            else:
+                # This is a file content (primitive or str)
+                os.makedirs(os.path.dirname(base_path), exist_ok=True)
+                if not isinstance(content, str):
+                    try:
+                        content = json.dumps(content, indent=2)
+                    except Exception:
+                        content = str(content)
+                with open(base_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                written_files += 1
+
         for section in ["frontend", "backend", "documentation", "api"]:
-            if section in files and files[section]:
+            if section in files:
                 section_path = os.path.join(project_path, section)
                 os.makedirs(section_path, exist_ok=True)
-
                 for filename, content in files[section].items():
-                    if not content:  # Skip empty files
-                        continue
-
                     filepath = os.path.join(section_path, filename)
-                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
-                    if not isinstance(content, str):
-                        content = json.dumps(content, indent=2)
-
-                    with open(filepath, "w", encoding="utf-8") as f:
-                        f.write(content)
-                    written_files += 1
-                    logging.info(f"Wrote file: {filepath}")
+                    write_content(filepath, content)
 
         if written_files == 0:
-            raise ValueError("No files were generated from the API response - all sections were empty")
+            raise ValueError("No files were generated from the API response")
 
-        # Create zip
         zip_base = os.path.join(OUTPUT_DIR, project_id)
         shutil.make_archive(zip_base, 'zip', project_path)
-        logging.info(f"Created zip archive at {zip_base}.zip")
 
         return f"{project_id}.zip"
 
@@ -413,12 +393,23 @@ def build_app_zip(data):
         logging.error(f"Error in build_app_zip: {str(e)}", exc_info=True)
         raise
 
+
+
+
+
+
+
 @api_view(['POST'])
-def generate_app(request):
+@permission_classes([AllowAny])
+def gemini_generate_app(request):
+    """
+    API endpoint with OpenAI integration
+    """
     try:
         data = request.data
         zip_filename = build_app_zip(data)
 
+        # Log the successful build
         with open(os.path.join(OUTPUT_DIR, "download_log.txt"), "a", encoding="utf-8") as log:
             log.write(f"{datetime.now()} | Built ZIP: {zip_filename}\n")
 
@@ -437,6 +428,9 @@ def generate_app(request):
 
 @api_view(['GET'])
 def download_zip(request, filename):
+    """
+    Secure file download endpoint
+    """
     if not re.match(r'^[a-f0-9\-]+\.zip$', filename):
         raise Http404("Invalid filename")
 
@@ -448,7 +442,45 @@ def download_zip(request, filename):
             filename=f"generated_app_{filename}"
         )
     raise Http404("File not found")
+
+
+from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+import os
+
+@csrf_exempt
+def preview_file(request, project_id, section, filename):
+    filepath = os.path.join("output", "projects", str(project_id), section, filename)
+
+    if not os.path.exists(filepath):
+        return JsonResponse({"error": "File not found"}, status=404)
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    return JsonResponse({"filename": filename, "content": content})
+
+@api_view(['GET'])
+def download_zip(request, filename):
+    """
+    Secure file download endpoint
+    """
+    if not re.match(r'^[a-f0-9\-]+\.zip$', filename):
+        raise Http404("Invalid filename")
+
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    if os.path.exists(filepath):
+        return FileResponse(
+            open(filepath, 'rb'),
+            as_attachment=True,
+            filename=f"generated_app_{filename}"
+        )
+    raise Http404("File not found")
+
+
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+import os
 
 @csrf_exempt
 def preview_file(request, project_id, section, filename):
