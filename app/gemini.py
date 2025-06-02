@@ -1,4 +1,3 @@
-
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.http import FileResponse, Http404
@@ -26,16 +25,16 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s'
 )
 
-# Constants
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-GEMINI_API_KEY = "AIzaSyCY4d_sqrw8mQwpvg7eQ4g2_tmnUYN1Ias"
-
 OUTPUT_DIR = "output"
 PROJECTS_DIR = os.path.join(OUTPUT_DIR, "projects")
 os.makedirs(PROJECTS_DIR, exist_ok=True)
 
-# PROMPT_MAP remains the same as in your original code
-# PROMPT_MAP as in your code, truncated here for brevity
+logging.basicConfig(
+    filename='output/app_generator.log',
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
+
 PROMPT_MAP = {
     ("python", "django rest"): """
 You are an expert full-stack developer using Django REST and React. Generate a complete production-ready full-stack web application named '{app_name}' with the following:
@@ -243,16 +242,10 @@ Return JSON:
 }}
 """
 }
-
 def build_prompt_from_data(data):
-    """
-    More robust prompt builder with framework aliases
-    """
-    # Normalize inputs
     language = data['language'].lower().strip()
     framework = data['framework'].lower().strip()
 
-    # Handle framework name variations
     framework_aliases = {
         'django rest': ['django rest', 'django-rest', 'django rest framework'],
         'flask': ['flask'],
@@ -261,7 +254,6 @@ def build_prompt_from_data(data):
         'next.js': ['next.js', 'next']
     }
 
-    # Find matching framework
     matched_framework = None
     for key, aliases in framework_aliases.items():
         if framework in aliases:
@@ -269,7 +261,7 @@ def build_prompt_from_data(data):
             break
 
     if not matched_framework:
-        available = [k for k in framework_aliases.keys()]
+        available = list(framework_aliases.keys())
         raise Exception(f"Unsupported framework. Available options: {available}")
 
     key = (language, matched_framework)
@@ -282,134 +274,151 @@ def build_prompt_from_data(data):
 
 
 def extract_json(text):
-    import re, json
-
-    # Remove markdown code blocks
-    text = re.sub(r'```json|```', '', text, flags=re.IGNORECASE).strip()
-
-    # Attempt to extract the first {...} block
+    text = re.sub(r"```json|```", "", text, flags=re.IGNORECASE).strip()
     start = text.find('{')
     end = text.rfind('}') + 1
+    if start == -1 or end == 0:
+        raise ValueError("No JSON object found in text")
+
     candidate = text[start:end]
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
 
-    # Fix trailing commas inside JSON
-    candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
-
-    # Now try to parse
     try:
         return json.loads(candidate)
     except json.JSONDecodeError as e:
-        # log or save candidate for debugging
-        with open("output/json_parse_error.txt", "w") as f:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        error_file = os.path.join(OUTPUT_DIR, "json_parse_error.txt")
+        with open(error_file, "w", encoding="utf-8") as f:
             f.write(candidate)
         raise e
 
 
-def build_app_zip(data):
+def serialize_content(content):
     """
-    Main application builder with Gemini API, handling both Django REST and Flask frameworks.
+    Ensure content is always a string before writing.
+    Handles dicts, lists, strings, and other types.
     """
+    if isinstance(content, (str, bytes)):
+        return content
     try:
-        required_keys = ['type', 'login', 'upload', 'layout', 'app_name',
-                         'framework', 'language', 'pages', 'color_scheme']
-        if not all(k in data for k in required_keys):
-            raise ValueError("Missing required fields in input data")
+        return json.dumps(content, indent=2, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
 
-        framework = data['framework'].lower()
 
-        # Generate prompt from user data
-        prompt = build_prompt_from_data(data)
-        logging.info(f"Generated prompt (truncated): {prompt[:200]}...")
+def normalize_gemini_response(data):
+    """
+    Recursively normalize Gemini JSON response so that every file content
+    is always a string (JSON stringified if needed).
+    """
+    if isinstance(data, dict):
+        normalized = {}
+        for key, value in data.items():
+            normalized[key] = normalize_gemini_response(value)
+        return normalized
+    elif isinstance(data, list):
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    elif isinstance(data, str):
+        return data
+    else:
+        return str(data)
 
-        # Call Gemini API
-        response_text = call_gemini_api(prompt)
 
-        # Save raw response for debugging
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        with open(os.path.join(OUTPUT_DIR, "raw_gemini_output.txt"), "w", encoding="utf-8") as f:
-            f.write(response_text)
+def flatten_and_serialize_files(base_path, data, written_files):
+    """
+    Recursively walk through the response and write files.
+    """
+    if isinstance(data, dict):
+        for key, value in data.items():
+            current_path = os.path.join(base_path, key)
 
-        # Parse JSON output from Gemini response
-        try:
-            files = extract_json(response_text)
-        except Exception as e:
-            with open(os.path.join(OUTPUT_DIR, "bad_json_response.txt"), "w", encoding="utf-8") as f:
-                f.write(response_text)
-            logging.error("JSON parsing failed - saved bad response")
-            raise
+            # Always create parent directory if it doesn't exist
+            os.makedirs(os.path.dirname(current_path), exist_ok=True)
 
-        project_id = str(uuid.uuid4())
-        project_path = os.path.join(PROJECTS_DIR, project_id)
-        os.makedirs(project_path, exist_ok=True)
-
-        written_files = 0
-
-        def write_content(base_path, content):
-            nonlocal written_files
-
-            if isinstance(content, dict):
-                if 'content' in content and isinstance(content['content'], str):
-                    # This is actually a file with metadata
-                    file_content = content['content']
-                    os.makedirs(os.path.dirname(base_path), exist_ok=True)
-                    with open(base_path, "w", encoding="utf-8") as f:
-                        f.write(file_content)
+            if isinstance(value, (dict, list)):
+                # If key looks like a file (has extension), write it
+                if '.' in key:
+                    with open(current_path, "w", encoding="utf-8") as f:
+                        f.write(serialize_content(value))
                     written_files += 1
                 else:
-                    # This is a directory
-                    os.makedirs(base_path, exist_ok=True)
-                    for name, sub_content in content.items():
-                        sub_path = os.path.join(base_path, name)
-                        write_content(sub_path, sub_content)
+                    # Directory - recurse
+                    os.makedirs(current_path, exist_ok=True)
+                    written_files = flatten_and_serialize_files(current_path, value, written_files)
             else:
-                # This is a file content (primitive or str)
-                os.makedirs(os.path.dirname(base_path), exist_ok=True)
-                if not isinstance(content, str):
-                    try:
-                        content = json.dumps(content, indent=2)
-                    except Exception:
-                        content = str(content)
-                with open(base_path, "w", encoding="utf-8") as f:
-                    f.write(content)
+                # Write the file
+                with open(current_path, "w", encoding="utf-8") as f:
+                    f.write(serialize_content(value))
                 written_files += 1
 
-        for section in ["frontend", "backend", "documentation", "api"]:
-            if section in files:
-                section_path = os.path.join(project_path, section)
-                os.makedirs(section_path, exist_ok=True)
-                for filename, content in files[section].items():
-                    filepath = os.path.join(section_path, filename)
-                    write_content(filepath, content)
+    elif isinstance(data, list):
+        # Write lists as JSON files
+        output_path = os.path.join(base_path, "output.json")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(serialize_content(data))
+        written_files += 1
 
-        if written_files == 0:
-            raise ValueError("No files were generated from the API response")
+    else:
+        # Write anything else as a file
+        output_path = os.path.join(base_path, "output.txt")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(serialize_content(data))
+        written_files += 1
 
-        zip_base = os.path.join(OUTPUT_DIR, project_id)
-        shutil.make_archive(zip_base, 'zip', project_path)
-
-        return f"{project_id}.zip"
-
-    except Exception as e:
-        logging.error(f"Error in build_app_zip: {str(e)}", exc_info=True)
-        raise
+    return written_files
 
 
+def build_app_zip(data):
+    required_keys = ['type', 'login', 'upload', 'layout', 'app_name',
+                     'framework', 'language', 'pages', 'color_scheme']
 
+    missing = [k for k in required_keys if k not in data]
+    if missing:
+        raise ValueError(f"Missing required fields: {missing}")
 
+    prompt = build_prompt_from_data(data)
+    logging.info(f"Prompt generated (start): {prompt[:200]}...")
 
+    response_text = call_gemini_api(prompt)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    raw_output_file = os.path.join(OUTPUT_DIR, "raw_openai_output.txt")
+    with open(raw_output_file, "w", encoding="utf-8") as f:
+        f.write(response_text)
+
+    files = extract_json(response_text)
+    normalized_files = normalize_gemini_response(files)
+
+    project_id = str(uuid.uuid4())
+    project_path = os.path.join(PROJECTS_DIR, project_id)
+    os.makedirs(project_path, exist_ok=True)
+
+    written_files = 0
+
+    for section in ["frontend", "backend", "documentation", "api"]:
+        if section in normalized_files:
+            section_path = os.path.join(project_path, section)
+            os.makedirs(section_path, exist_ok=True)
+            section_content = normalized_files[section]
+            written_files = flatten_and_serialize_files(section_path, section_content, written_files)
+
+    if written_files == 0:
+        raise ValueError("No files generated from the API response")
+
+    zip_base = os.path.join(OUTPUT_DIR, project_id)
+    shutil.make_archive(zip_base, 'zip', project_path)
+
+    return f"{project_id}.zip"
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def gemini_generate_app(request):
-    """
-    API endpoint with OpenAI integration
-    """
     try:
         data = request.data
         zip_filename = build_app_zip(data)
 
-        # Log the successful build
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         with open(os.path.join(OUTPUT_DIR, "download_log.txt"), "a", encoding="utf-8") as log:
             log.write(f"{datetime.now()} | Built ZIP: {zip_filename}\n")
 
@@ -425,71 +434,3 @@ def gemini_generate_app(request):
             "error": str(e),
             "details": "See server logs for more information"
         }, status=500)
-
-@api_view(['GET'])
-def download_zip(request, filename):
-    """
-    Secure file download endpoint
-    """
-    if not re.match(r'^[a-f0-9\-]+\.zip$', filename):
-        raise Http404("Invalid filename")
-
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    if os.path.exists(filepath):
-        return FileResponse(
-            open(filepath, 'rb'),
-            as_attachment=True,
-            filename=f"generated_app_{filename}"
-        )
-    raise Http404("File not found")
-
-
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-import os
-
-@csrf_exempt
-def preview_file(request, project_id, section, filename):
-    filepath = os.path.join("output", "projects", str(project_id), section, filename)
-
-    if not os.path.exists(filepath):
-        return JsonResponse({"error": "File not found"}, status=404)
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    return JsonResponse({"filename": filename, "content": content})
-
-@api_view(['GET'])
-def download_zip(request, filename):
-    """
-    Secure file download endpoint
-    """
-    if not re.match(r'^[a-f0-9\-]+\.zip$', filename):
-        raise Http404("Invalid filename")
-
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    if os.path.exists(filepath):
-        return FileResponse(
-            open(filepath, 'rb'),
-            as_attachment=True,
-            filename=f"generated_app_{filename}"
-        )
-    raise Http404("File not found")
-
-
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-import os
-
-@csrf_exempt
-def preview_file(request, project_id, section, filename):
-    filepath = os.path.join("output", "projects", str(project_id), section, filename)
-
-    if not os.path.exists(filepath):
-        return JsonResponse({"error": "File not found"}, status=404)
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    return JsonResponse({"filename": filename, "content": content})

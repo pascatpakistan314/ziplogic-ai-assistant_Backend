@@ -16,6 +16,9 @@ from .model_selector import call_model
 from .ai_gemini import call_gemini_api
 from .ai_gpt import call_openai_api
 import json5
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework.decorators import authentication_classes, permission_classes
+from rest_framework.permissions import AllowAny
 
 
 # Setup logging for debugging
@@ -436,6 +439,7 @@ def generate_app(request):
         }, status=500)
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def download_zip(request, filename):
     if not re.match(r'^[a-f0-9\-]+\.zip$', filename):
         raise Http404("Invalid filename")
